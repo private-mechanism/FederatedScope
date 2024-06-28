@@ -5,7 +5,7 @@ import pickle
 
 from federatedscope.core.message import Message
 from federatedscope.core.communication import StandaloneCommManager, \
-    StandaloneDDPCommManager, gRPCCommManager
+    gRPCCommManager
 from federatedscope.core.monitors.early_stopper import EarlyStopper
 from federatedscope.core.auxiliaries.trainer_builder import get_trainer
 from federatedscope.core.secret_sharing import AdditiveSecretSharing
@@ -14,7 +14,6 @@ from federatedscope.core.auxiliaries.utils import merge_dict_of_results, \
 from federatedscope.core.workers.base_client import BaseClient
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class Client(BaseClient):
@@ -106,7 +105,6 @@ class Client(BaseClient):
                                    config=self._cfg,
                                    is_attacker=self.is_attacker,
                                    monitor=self._monitor)
-        self.device = device
 
         # For client-side evaluation
         self.best_results = dict()
@@ -151,12 +149,8 @@ class Client(BaseClient):
         self.server_id = server_id
         if self.mode == 'standalone':
             comm_queue = kwargs['shared_comm_queue']
-            if self._cfg.federate.process_num <= 1:
-                self.comm_manager = StandaloneCommManager(
-                    comm_queue=comm_queue, monitor=self._monitor)
-            else:
-                self.comm_manager = StandaloneDDPCommManager(
-                    comm_queue=comm_queue, monitor=self._monitor)
+            self.comm_manager = StandaloneCommManager(comm_queue=comm_queue,
+                                                      monitor=self._monitor)
             self.local_address = None
         elif self.mode == 'distributed':
             host = kwargs['host']
@@ -196,6 +190,8 @@ class Client(BaseClient):
         for model_index in range(len(init_model)):
             model_delta = copy.deepcopy(init_model[model_index])
             for key in init_model[model_index].keys():
+                if key not in updated_model[model_index]:
+                    continue
                 model_delta[key] = updated_model[model_index][
                     key] - init_model[model_index][key]
             model_deltas.append(model_delta)
@@ -228,13 +224,6 @@ class Client(BaseClient):
 
             if msg.msg_type == 'finish':
                 break
-
-    def run_standalone(self):
-        """
-        Run in standalone mode
-        """
-        self.join_in()
-        self.run()
 
     def callback_funcs_for_model_para(self, message: Message):
         """
@@ -295,9 +284,6 @@ class Client(BaseClient):
             # ensure all the model params (which might be updated by other
             # clients in the previous local training process) are overwritten
             # and synchronized with the received model
-            if self._cfg.federate.process_num > 1:
-                for k, v in content.items():
-                    content[k] = v.to(self.device)
             self.trainer.update(content,
                                 strict=self._cfg.federate.share_local_model)
             self.state = round
@@ -385,7 +371,9 @@ class Client(BaseClient):
                 self.msg_buffer['train'][self.state] = [(sample_size,
                                                          content_frame)]
             else:
-                if self._cfg.asyn.use or self._cfg.aggregator.krum.use:
+                if self._cfg.asyn.use or self._cfg.aggregator.robust_rule in \
+                        ['krum', 'normbounding', 'median', 'trimmedmean',
+                         'bulyan','dynamic']:
                     # Return the model delta when using asynchronous training
                     # protocol, because the staled updated might be discounted
                     # and cause that the sum of the aggregated weights might

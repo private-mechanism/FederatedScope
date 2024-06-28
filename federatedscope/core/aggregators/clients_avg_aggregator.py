@@ -2,6 +2,7 @@ import os
 import torch
 from federatedscope.core.aggregators import Aggregator
 from federatedscope.core.auxiliaries.utils import param2tensor
+import copy
 
 
 class ClientsAvgAggregator(Aggregator):
@@ -19,10 +20,8 @@ class ClientsAvgAggregator(Aggregator):
     def aggregate(self, agg_info):
         """
         To preform aggregation
-
         Arguments:
             agg_info (dict): the feedbacks from clients
-
         Returns:
             dict: the aggregated results
         """
@@ -61,13 +60,15 @@ class ClientsAvgAggregator(Aggregator):
         """
         Calculates the weighted average of models.
         """
+        models = [model[0] for model in models]
         training_set_size = 0
         for i in range(len(models)):
             sample_size, _ = models[i]
             training_set_size += sample_size
 
-        sample_size, avg_model = models[0]
+        sample_size, avg_model = copy.deepcopy(models[0])
         for key in avg_model:
+            # if 'bn' not in key:
             for i in range(len(models)):
                 local_sample_size, local_model = models[i]
 

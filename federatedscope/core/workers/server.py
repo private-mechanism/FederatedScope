@@ -2,15 +2,15 @@ import logging
 import copy
 import os
 import sys
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pickle
-import time
 
 from federatedscope.core.monitors.early_stopper import EarlyStopper
 from federatedscope.core.message import Message
 from federatedscope.core.communication import StandaloneCommManager, \
-    StandaloneDDPCommManager, gRPCCommManager
+    gRPCCommManager
 from federatedscope.core.auxiliaries.aggregator_builder import get_aggregator
 from federatedscope.core.auxiliaries.sampler_builder import get_sampler
 from federatedscope.core.auxiliaries.utils import merge_dict_of_results, \
@@ -20,7 +20,6 @@ from federatedscope.core.secret_sharing import AdditiveSecretSharing
 from federatedscope.core.workers.base_server import BaseServer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class Server(BaseServer):
@@ -90,8 +89,7 @@ class Server(BaseServer):
             self._cfg.early_stop.improve_indicator_mode,
             self._monitor.the_larger_the_better)
 
-        if self._cfg.federate.share_local_model \
-                and not self._cfg.federate.process_num > 1:
+        if self._cfg.federate.share_local_model:
             # put the model to the specified device
             model.to(device)
         # Build aggregator
@@ -130,18 +128,20 @@ class Server(BaseServer):
             shared_party_num=int(self._cfg.federate.sample_client_num)
         ).fixedpoint2float if self._cfg.federate.use_ss else None
 
-        if self._cfg.federate.make_global_eval:
+        if self._cfg.federate.make_global_eval \
+                or self.aggregator.robust_rule == 'dynamic'\
+                        or self._cfg.attack.attack_method == 'pga_attack':
             # set up a trainer for conducting evaluation in server
-            assert self.models is not None
+            assert self.model is not None
             assert self.data is not None
             self.trainer = get_trainer(
-                model=self.models[0],
+                model=self.model,
                 data=self.data,
                 device=self.device,
                 config=self._cfg,
-                only_for_eval=True,
                 monitor=self._monitor
-            )  # the trainer is only used for global evaluation
+            )  
+            # the trainer is only used for global evaluation
             self.trainers = [self.trainer]
             if self.model_num > 1:
                 # By default, the evaluation is conducted by calling
@@ -150,6 +150,11 @@ class Server(BaseServer):
                     copy.deepcopy(self.trainer)
                     for _ in range(self.model_num - 1)
                 ])
+
+            if self._cfg.attack.attack_method == 'pga_attack' or\
+                  self._cfg.aggregator.robust_rule == 'dynamic':
+                from federatedscope.attack.trainer import wrap_SGAAttackTrainer
+                self.mal_sga_trainer = wrap_SGAAttackTrainer(copy.deepcopy(self.trainer))
 
         # Initialize the number of joined-in clients
         self._client_num = client_num
@@ -198,16 +203,9 @@ class Server(BaseServer):
         self.msg_buffer = {'train': dict(), 'eval': dict()}
         self.staled_msg_buffer = list()
         if self.mode == 'standalone':
-            comm_queue = kwargs.get('shared_comm_queue', None)
-            if self._cfg.federate.process_num > 1:
-                id2comm = kwargs.get('id2comm', None)
-                self.comm_manager = StandaloneDDPCommManager(
-                    comm_queue=comm_queue,
-                    monitor=self._monitor,
-                    id2comm=id2comm)
-            else:
-                self.comm_manager = StandaloneCommManager(
-                    comm_queue=comm_queue, monitor=self._monitor)
+            comm_queue = kwargs['shared_comm_queue']
+            self.comm_manager = StandaloneCommManager(comm_queue=comm_queue,
+                                                      monitor=self._monitor)
         elif self.mode == 'distributed':
             host = kwargs['host']
             port = kwargs['port']
@@ -332,6 +330,7 @@ class Server(BaseServer):
             if not check_eval_result:
                 # Receiving enough feedback in the training process
                 aggregated_num = self._perform_federated_aggregation()
+
                 self.state += 1
                 if self.state % self._cfg.eval.freq == 0 and self.state != \
                         self.total_round_num:
@@ -352,16 +351,14 @@ class Server(BaseServer):
                     # Start a new training round
                     self._start_new_training_round(aggregated_num)
                 else:
+                    # plot the histogram of the aggregated clients
                     # Final Evaluate
                     logger.info('Server: Training is finished! Starting '
                                 'evaluation.')
                     self.eval()
-
             else:
                 # Receiving enough feedback in the evaluation process
                 self._merge_and_format_eval_results()
-                if self.state >= self.total_round_num:
-                    self.is_finish = True
 
         else:
             move_on_flag = False
@@ -373,7 +370,6 @@ class Server(BaseServer):
         To save the results and save model after each evaluation, and check \
         whether to early stop.
         """
-
         # early stopping
         if "Results_weighted_avg" in self.history_results and \
                 self._cfg.eval.best_res_update_round_wise_key in \
@@ -410,6 +406,20 @@ class Server(BaseServer):
             if not self._cfg.federate.make_global_eval:
                 self.save_client_eval_results()
             self.terminate(msg_type='finish')
+            # id_freq = list()
+            # for i in range(self._cfg.federate.client_num):
+            #     i_freq=0
+            #     for li in self.aggregation_id_list:
+            #         if i+1 in li:
+            #             i_freq += 1
+            #     id_freq.append(i_freq)
+            # with open(os.path.join(self._cfg.outdir, "eval_results.log"),"a") as outfile:
+            #         outfile.write(str(self.aggregation_id_list) + "\n")
+            # plt.bar([i+1 for i in range(self._cfg.federate.client_num)],id_freq, color='blue')
+            # path= os.path.join(self._cfg.outdir, "client_freq.jpg")
+            # plt.savefig(path)
+            # with open(os.path.join(self._cfg.outdir, "eval_results.log"),"a") as outfile:
+            #         outfile.write(str(self.aggregation_rule) + "\n")
 
         # Clean the clients evaluation msg buffer
         if not self._cfg.federate.make_global_eval:
@@ -433,13 +443,12 @@ class Server(BaseServer):
 
             for client_id in train_msg_buffer.keys():
                 if self.model_num == 1:
-                    msg_list.append(train_msg_buffer[client_id])
+                    msg_list.append((train_msg_buffer[client_id],client_id))
                 else:
                     train_data_size, model_para_multiple = \
                         train_msg_buffer[client_id]
                     msg_list.append(
-                        (train_data_size, model_para_multiple[model_idx]))
-
+                        (train_data_size, model_para_multiple[model_idx],client_id))
                 # The staleness of the messages in train_msg_buffer
                 # should be 0
                 staleness.append((client_id, 0))
@@ -456,7 +465,7 @@ class Server(BaseServer):
                 staleness.append((client_id, self.state - state))
 
             # Trigger the monitor here (for training)
-            self._monitor.calc_model_metric(self.models[0].state_dict(),
+            self._monitor.calc_model_metric(self.model.state_dict(),
                                             msg_list,
                                             rnd=self.state)
 
@@ -465,15 +474,23 @@ class Server(BaseServer):
             agg_info = {
                 'client_feedback': msg_list,
                 'recover_fun': self.recover_fun,
-                'staleness': staleness,
+                'staleness': staleness
             }
             # logger.info(f'The staleness is {staleness}')
+            if self._cfg.aggregator.robust_rule == 'dynamic':
+                if self._cfg.aggregator.BFT_args.dynamic_weighted == True:
+                    agg_info['global_delta'] = self._mal_global_trainer()
+                else:
+                    agg_info['global_delta'] = 0
+            
+            if self._cfg.attack.attack_method.lower() == 'pga_attack':
+                agg_info['malicious_delta'] = self._mal_global_trainer()
             result = aggregator.aggregate(agg_info)
             # Due to lazy load, we merge two state dict
             merged_param = merge_param_dict(model.state_dict().copy(), result)
             model.load_state_dict(merged_param, strict=False)
-
         return aggregated_num
+
 
     def _start_new_training_round(self, aggregated_num=0):
         """
@@ -664,7 +681,7 @@ class Server(BaseServer):
             model_para = [{} if skip_broadcast else model.state_dict()
                           for model in self.models]
         else:
-            model_para = {} if skip_broadcast else self.models[0].state_dict()
+            model_para = {} if skip_broadcast else self.model.state_dict()
 
         # We define the evaluation happens at the end of an epoch
         rnd = self.state - 1 if msg_type == 'evaluate' else self.state
@@ -689,7 +706,6 @@ class Server(BaseServer):
         To broadcast the communication addresses of clients (used for \
         additive secret sharing)
         """
-
         self.comm_manager.send(
             Message(msg_type='address',
                     sender=self.ID,
@@ -781,7 +797,7 @@ class Server(BaseServer):
             else:
                 if self._cfg.backend == 'torch':
                     model_size = sys.getsizeof(pickle.dumps(
-                        self.models[0])) / 1024.0 * 8.
+                        self.model)) / 1024.0 * 8.
                 else:
                     # TODO: calculate model size for TF Model
                     model_size = 1.0
@@ -815,9 +831,6 @@ class Server(BaseServer):
             logger.info(
                 '----------- Starting training (Round #{:d}) -------------'.
                 format(self.state))
-            print(
-                time.strftime('%Y-%m-%d %H:%M:%S',
-                              time.localtime(time.time())))
 
     def trigger_for_feat_engr(self,
                               trigger_train_func,
@@ -851,7 +864,7 @@ class Server(BaseServer):
         if self.model_num > 1:
             model_para = [model.state_dict() for model in self.models]
         else:
-            model_para = self.models[0].state_dict()
+            model_para = self.model.state_dict()
 
         self._monitor.finish_fl()
 
@@ -866,9 +879,8 @@ class Server(BaseServer):
     def eval(self):
         """
         To conduct evaluation. When ``cfg.federate.make_global_eval=True``, \
-        a global evaluation is conducted by the server.
+        a global evaluation is conducted by the server.w
         """
-
         if self._cfg.federate.make_global_eval:
             # By default, the evaluation is conducted one-by-one for all
             # internal models;
@@ -900,6 +912,42 @@ class Server(BaseServer):
             # Preform evaluation in clients
             self.broadcast_model_para(msg_type='evaluate',
                                       filter_unseen_clients=False)
+
+    def _calculate_model_delta(self, init_model, updated_model):
+        model_delta = copy.deepcopy(self.model.state_dict())
+        tmp_ini =  copy.deepcopy(init_model)
+        for key in model_delta:
+            if key not in updated_model:
+                model_delta[key] = init_model[key] - tmp_ini[key]
+            else:
+                model_delta[key] = updated_model[key] - init_model[key]
+        return model_delta
+            
+    def _global_trainer(self):
+        """
+        The function is applied to conduct the global model training on a root dataset. \
+        For now, this function is simply used to implement the Fltrust aggregator, which \
+        is an advanced byzantine robust aggregator.
+        """
+        temp_model = copy.deepcopy(self.model.state_dict())
+        _, model_para_all, _ = self.trainer.train(target_data_split_name='train')
+        global_delta = self._calculate_model_delta(init_model=temp_model, updated_model=model_para_all)
+        for key in temp_model:
+            self.model.state_dict()[key] = temp_model[key]
+        return global_delta
+    
+    def _mal_global_trainer(self):
+        """
+        The function is applied to conduct the model finetuning on a root dataset. \
+        For now, this function is simply used to simulate the PGA attacker, which \
+        should have been done by the malicious clients.
+        """
+        temp_model = copy.deepcopy(self.model.state_dict())
+        _, model_para_all, _ = self.mal_sga_trainer.train(target_data_split_name='val')
+        global_delta = self._calculate_model_delta(init_model=temp_model, updated_model=model_para_all)
+        self.model.load_state_dict(temp_model)
+        return global_delta
+
 
     def callback_funcs_model_para(self, message: Message):
         """
@@ -945,7 +993,6 @@ class Server(BaseServer):
                 'after_receiving':
             self.broadcast_model_para(msg_type='model_para',
                                       sample_client_num=1)
-
         return move_on_flag
 
     def callback_funcs_for_join_in(self, message: Message):

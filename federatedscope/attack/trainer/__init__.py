@@ -4,6 +4,8 @@ from federatedscope.attack.trainer.PIA_trainer import *
 from federatedscope.attack.trainer.backdoor_trainer import *
 from federatedscope.attack.trainer.benign_trainer import *
 from federatedscope.attack.trainer.gaussian_attack_trainer import *
+from federatedscope.attack.trainer.label_flipping_trainer import *
+from federatedscope.attack.trainer.malicious_SGA_attack_trainer import *
 
 __all__ = [
     'wrap_GANTrainer', 'hood_on_fit_start_generator',
@@ -13,5 +15,6 @@ __all__ = [
     'hook_on_fit_start_count_round', 'hook_on_batch_start_replace_data_batch',
     'hook_on_batch_backward_invert_gradient',
     'hook_on_fit_start_loss_on_target_data', 'wrap_backdoorTrainer',
-    'wrap_benignTrainer', 'wrap_GaussianAttackTrainer'
+    'wrap_benignTrainer', 'wrap_GaussianAttackTrainer','wrap_LabelFlippingTrainer',
+    'wrap_SGAAttackTrainer'
 ]

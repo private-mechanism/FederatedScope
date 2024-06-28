@@ -28,7 +28,6 @@ def wrap_GaussianAttackTrainer(
 
 
 def hook_on_batch_backward_generate_gaussian_noise_gradient(ctx):
-    ctx.optimizer.zero_grad()
     ctx.loss_task.backward()
 
     grad_values = list()
@@ -37,7 +36,8 @@ def hook_on_batch_backward_generate_gaussian_noise_gradient(ctx):
             grad_values.append(param.grad.detach().cpu().view(-1))
 
     grad_values = torch.cat(grad_values)
-    mean_for_gaussian_noise = torch.mean(grad_values) + 0.1
+    # mean_for_gaussian_noise = torch.mean(grad_values) + 0.1
+    mean_for_gaussian_noise = 0
     std_for_gaussian_noise = torch.std(grad_values)
 
     for name, param in ctx.model.named_parameters():
